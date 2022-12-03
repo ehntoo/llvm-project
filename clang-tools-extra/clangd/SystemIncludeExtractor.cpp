@@ -135,11 +135,10 @@ llvm::Optional<DriverInfo> parseDriverOutput(llvm::StringRef Output) {
   return std::move(Info);
 }
 
-llvm::Optional<DriverInfo>
-extractSystemIncludesAndTarget(llvm::SmallString<128> Driver,
-                               llvm::StringRef Lang,
-                               llvm::ArrayRef<std::string> CommandLine,
-                               const llvm::Regex &QueryDriverRegex) {
+llvm::Optional<DriverInfo> extractSystemIncludesAndTarget(
+    llvm::SmallString<128> Driver, llvm::StringRef Lang,
+    llvm::ArrayRef<llvm::StringRef> AdditionalDriverArgs,
+    const llvm::Regex &QueryDriverRegex) {
   trace::Span Tracer("Extract system includes and target");
 
   if (!llvm::sys::path::is_absolute(Driver)) {
@@ -180,33 +179,7 @@ extractSystemIncludesAndTarget(llvm::SmallString<128> Driver,
   llvm::SmallVector<llvm::StringRef> Args = {Driver, "-E", "-x",
                                              Lang,   "-",  "-v"};
 
-  // These flags will be preserved
-  const llvm::StringRef FlagsToPreserve[] = {
-      "-nostdinc", "--no-standard-includes", "-nostdinc++", "-nobuiltininc"};
-  // Preserves these flags and their values, either as separate args or with an
-  // equalsbetween them
-  const llvm::StringRef ArgsToPreserve[] = {"--sysroot", "-isysroot"};
-
-  for (size_t I = 0, E = CommandLine.size(); I < E; ++I) {
-    llvm::StringRef Arg = CommandLine[I];
-    if (llvm::is_contained(FlagsToPreserve, Arg)) {
-      Args.push_back(Arg);
-    } else {
-      const auto *Found =
-          llvm::find_if(ArgsToPreserve, [&Arg](llvm::StringRef S) {
-            return Arg.startswith(S);
-          });
-      if (Found == std::end(ArgsToPreserve))
-        continue;
-      Arg = Arg.drop_front(Found->size());
-      if (Arg.empty() && I + 1 < E) {
-        Args.push_back(CommandLine[I]);
-        Args.push_back(CommandLine[++I]);
-      } else if (Arg.startswith("=")) {
-        Args.push_back(CommandLine[I]);
-      }
-    }
-  }
+  llvm::append_range(Args, AdditionalDriverArgs);
 
   std::string ErrMsg;
   if (int RC = llvm::sys::ExecuteAndWait(Driver, Args, /*Env=*/llvm::None,
@@ -325,12 +298,34 @@ public:
       return;
 
     llvm::StringRef Lang;
+    llvm::SmallVector<llvm::StringRef> AdditionalDriverArgs;
+
+    // These flags will be preserved
+    const llvm::StringRef FlagsToPreserve[] = {
+        "-nostdinc", "--no-standard-includes", "-nostdinc++", "-nobuiltininc"};
+    // Preserve these flags and their values when provided as separate args
+    const llvm::StringRef TwoPartArgsToPreserve[] = {"--sysroot", "-isysroot"};
+    // Preserve these flags and their values when provided as a single arg
+    const llvm::StringRef ArgPrefixesToPreserve[] = {
+        "-isysroot", "--sysroot=", "-specs=", "--specs="};
+
     for (size_t I = 0, E = Cmd.CommandLine.size(); I < E; ++I) {
       llvm::StringRef Arg = Cmd.CommandLine[I];
-      if (Arg == "-x" && I + 1 < E)
-        Lang = Cmd.CommandLine[I + 1];
-      else if (Arg.startswith("-x"))
+      if (Arg == "-x" && I + 1 < E) {
+        Lang = Cmd.CommandLine[++I];
+      } else if (Arg.startswith("-x")) {
         Lang = Arg.drop_front(2).trim();
+      } else if (llvm::is_contained(FlagsToPreserve, Arg)) {
+        AdditionalDriverArgs.push_back(Arg);
+      } else if (llvm::is_contained(TwoPartArgsToPreserve, Arg) && I + 1 < E) {
+        AdditionalDriverArgs.push_back(Arg);
+        AdditionalDriverArgs.push_back(Cmd.CommandLine[++I]);
+      } else if (llvm::any_of(ArgPrefixesToPreserve,
+                              [&Arg](const llvm::StringRef Prefix) {
+                                return Arg.starts_with(Prefix);
+                              })) {
+        AdditionalDriverArgs.push_back(Arg);
+      }
     }
     if (Lang.empty()) {
       llvm::StringRef Ext = llvm::sys::path::extension(File).trim('.');
@@ -349,11 +344,14 @@ public:
       // relative or absolute).
       llvm::sys::fs::make_absolute(Cmd.Directory, Driver);
 
-    if (auto Info =
-            QueriedDrivers.get(/*Key=*/(Driver + ":" + Lang).str(), [&] {
-              return extractSystemIncludesAndTarget(
-                  Driver, Lang, Cmd.CommandLine, QueryDriverRegex);
-            })) {
+    std::string CacheKey = (Driver + ":" + Lang).str();
+    if (!AdditionalDriverArgs.empty())
+      CacheKey += ":" + llvm::join(AdditionalDriverArgs, ":");
+
+    if (auto Info = QueriedDrivers.get(/*Key=*/CacheKey, [&] {
+          return extractSystemIncludesAndTarget(
+              Driver, Lang, AdditionalDriverArgs, QueryDriverRegex);
+        })) {
       setTarget(addSystemIncludes(Cmd, Info->SystemIncludes), Info->Target);
     }
   }
